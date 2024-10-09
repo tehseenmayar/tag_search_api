@@ -4,6 +4,9 @@ import os
 import threading
 from typing import List
 
+import numpy as np
+from sklearn.decomposition import PCA
+
 import pandas as pd
 from fastapi import (BackgroundTasks, FastAPI, File, HTTPException, Request,
                      UploadFile)
@@ -62,7 +65,23 @@ async def log_requests(request: Request, call_next):
     logger.info(f"Response status: {response.status_code}")
     return response
 
+@app.post("/upload-syn-csv/")
+async def upload_syn_csv(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400,
+                            detail="Invalid file format. Please upload a CSV file (needs to env with '.csv'.")
+    
+    content = await file.read()
+    global df
+    df = pd.read_csv(io.BytesIO(content), sep=None, header=0)
 
+    if 'name' not in df.columns:
+        raise HTTPException(status_code=400, detail="CSV file must contain a 'name' column.")
+    if 'synonym' not in df.columns:
+        raise HTTPException(status_code=400, detail="CSV file must contain a 'synonym' column.")
+    
+    return {"message": "File accepted for processing. Synonyms will be extracted."}
+        
 @app.post("/upload-csv/")
 async def upload_csv(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     if task_running.is_set():
@@ -101,9 +120,17 @@ async def upload_csv(background_tasks: BackgroundTasks, file: UploadFile = File(
 def process_csv(names_storage: List[str]):
     try:
         # Store embedded vectors for semantic search
+        global pca
+        vectors = []
         for name in names_storage:
             vector = embedder.embed(name)
-            vec_db.store(vector, {"name": name})
+            vectors.append(vector)
+        pca = PCA(n_components=0.9)
+        pca.fit(vectors)
+        new_vectors = pca.transform(vectors)
+
+        for name, n_vector in zip(names_storage, new_vectors):
+            vec_db.store(n_vector, {"name": name})
 
         app.names_storage = names_storage
         app.fuzzy_matcher = FuzzyMatcher(app.names_storage)
@@ -124,11 +151,37 @@ async def search(query: str, k: int = 5):
     if not query:
         raise HTTPException(status_code=400, detail="Query parameter is required.")
 
+    global df 
+    matched_df = df[df["name"]==query].reset_index()
+    if len(matched_df) > 1:
+        total_matches_fuzzy = []
+        total_matches_samntic = []
+        
+       for i in range(len(matched_df)):
+           fuzzy_matches = app.fuzzy_matcher.get_top_k_matches(matched_df["synonym"][i], k)
+           query_vector = embedder.embed(matched_df["synonym"][i])
+           global pca
+           query_vector = pca.transform([query_vector])[0]
+           semantic_matches = vec_db.find_closest(query_vector, k)
+           total_matches_samntic += [{"name": match.payload["name"], "score": match.score} for match in semantic_matches]
+           total_matches_fuzzy += [{"name": match["matched"], "score": match["score"]} for match in fuzzy_matches]
+        top5_semantic_matches = random.sample(total_matches_samntic, min(5, len(total_matches_samntic)))
+        top5_fuzzy_matches = random.sample(total_matches_fuzzy, min(5, len(total_matches_fuzzy)))
+           
+        response = {"match": {"semantic": top5_semantic_matches, "typo": top5_fuzzy_matches}}
+        return JSONResponse(content=response)
+           
+           
+    elif len(matched_df) == 1:
+        query = matched_df["synonym"][0]
+        
     # Fuzzy search
     fuzzy_matches = app.fuzzy_matcher.get_top_k_matches(query, k)
 
     # Semantic search
     query_vector = embedder.embed(query)
+    global pca
+    query_vector = pca.transform([query_vector])[0]
     semantic_matches = vec_db.find_closest(query_vector, k)
 
     # Formatting the response
